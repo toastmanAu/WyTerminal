@@ -225,9 +225,9 @@ static size_t  s_jpg_received = 0;
 static bool    s_jpg_mode = false;
 
 void check_serial() {
-    while (Serial.available()) {
+    while (Serial0.available()) {
         if (s_jpg_mode) {
-            int b = Serial.read();
+            int b = Serial0.read();
             if (s_jpg_received < sizeof(s_jpg_buf))
                 s_jpg_buf[s_jpg_received++] = (uint8_t)b;
             if (s_jpg_received >= s_jpg_expected) {
@@ -235,7 +235,7 @@ void check_serial() {
                 s_jpg_mode = false; s_jpg_expected = 0; s_jpg_received = 0;
             }
         } else {
-            String line = Serial.readStringUntil('\n'); line.trim();
+            String line = Serial0.readStringUntil('\n'); line.trim();
             if (!line.length()) continue;
             if      (line.startsWith("OUT:")) term_ok(line.substring(4).c_str());
             else if (line.startsWith("ERR:")) term_err(line.substring(4).c_str());
@@ -265,7 +265,7 @@ void handle_update(JsonObject &upd) {
     if (t.startsWith("/shell ") || t == "/screenshot" ||
         t.startsWith("/upload ") || t == "/clipboard" ||
         t == "/sysinfo" || t == "/ps") {
-        Serial.println("CMD:" + t);
+        Serial0.println("CMD:" + t);
         tg_send(chat_id, "⏳ running...");
         return;
     }
@@ -373,7 +373,8 @@ void poll_telegram() {
 
 // ── Setup ─────────────────────────────────────────────────────────────
 void setup() {
-    Serial.begin(115200);
+    Serial0.begin(115200); // UART (ACM0 on host)
+    Serial.begin(115200);   // USB CDC (debug)
     pinMode(LCD_PWR, OUTPUT); digitalWrite(LCD_PWR, HIGH); delay(50);
 
     gfx->begin();
