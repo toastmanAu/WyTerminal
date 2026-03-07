@@ -133,24 +133,23 @@ def disable_ssh_if_we_enabled(target_id):
 def screenshot_local():
     path = "/tmp/wyterm-shot.png"
     wayland = os.environ.get("WAYLAND_DISPLAY", "")
-    env = {**os.environ, "DISPLAY": DISPLAY}
+    dbus    = "unix:path=/run/user/1000/bus"
+    env = {**os.environ, "DISPLAY": DISPLAY,
+           "DBUS_SESSION_BUS_ADDRESS": dbus}
     if wayland:
         env["WAYLAND_DISPLAY"] = wayland
-    # Try tools in order — grim for Wayland, scrot/import for X11
-    candidates = []
-    if wayland:
-        candidates += [
-            f"grim {path}",
-            f"WAYLAND_DISPLAY={wayland} grim {path}",
-        ]
-    candidates += [
+    candidates = [
+        # Best: gnome-screenshot via proper dbus session (Wayland + X11)
+        f"gnome-screenshot -f {path}",
+        # Wayland: grim
+        f"grim {path}",
+        # X11 fallbacks
         f"scrot {path}",
         f"import -window root {path}",
-        f"ffmpeg -y -f x11grab -i {DISPLAY} -vframes 1 {path} 2>/dev/null",
     ]
     for c in candidates:
         r = subprocess.run(c, shell=True, env=env, capture_output=True)
-        if r.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 100:
+        if r.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 500:
             with open(path, "rb") as f: data = f.read()
             os.remove(path)
             return data
