@@ -320,6 +320,15 @@ void handle_update(JsonObject &upd) {
             term_ok(combo.c_str());
         } else { tg_send(chat_id, "❓ unknown key"); term_err("unknown key"); }
 
+    } else if (t == "/undeploy") {
+        const char *uninstaller =
+            "curl -fsSL https://wyltekindustries.com/wyterminal/uninstall.sh | sudo bash";
+        hid_type(uninstaller, true);
+        tg_send(chat_id,
+            "🗑 Uninstall command typed.\n"
+            "Daemon will be removed from target machine.");
+        term_ok("undeploying...");
+
     } else if (t == "/deploy") {
         // Type the one-liner installer into whatever terminal is open on target
         const char *installer =
