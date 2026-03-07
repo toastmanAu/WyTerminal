@@ -241,20 +241,30 @@ def process_command(cmd):
 # ── Serial listener ───────────────────────────────────────────────────
 def serial_listener():
     global ser
+    was_connected = False
     while True:
         try:
             print(f"[serial] connecting {args.port}...")
-            ser = serial.Serial(args.port, args.baud, timeout=1)
+            ser = serial.Serial(args.port, args.baud, timeout=1,
+                                dsrdtr=False, rtscts=False)
+            ser.dtr = False
+            ser.rts = False
             print(f"[serial] connected")
-            tg_send(f"🟢 WyTerminal daemon online\n{os.uname().nodename}")
+            if not was_connected:
+                tg_send(f"🟢 WyTerminal daemon online\n{os.uname().nodename}")
+            else:
+                tg_send(f"🟢 WyTerminal reconnected")
             serial_send_text("OUT:", f"daemon: {os.uname().nodename}")
+            was_connected = True
             while True:
                 line = ser.readline().decode("utf-8", errors="replace").strip()
                 if line and line.startswith("CMD:"):
                     process_command(line[4:])
         except serial.SerialException as e:
             print(f"[serial] error: {e}")
-            tg_send(f"🔴 Daemon disconnected: {e}")
+            if was_connected:
+                tg_send(f"🔴 WyTerminal unplugged")
+                was_connected = False
             ser = None
             time.sleep(3)
         except Exception as e:
