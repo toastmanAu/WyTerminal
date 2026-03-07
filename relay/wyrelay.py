@@ -132,10 +132,25 @@ def disable_ssh_if_we_enabled(target_id):
 # ── Screenshot ────────────────────────────────────────────────────────
 def screenshot_local():
     path = "/tmp/wyterm-shot.png"
+    wayland = os.environ.get("WAYLAND_DISPLAY", "")
     env = {**os.environ, "DISPLAY": DISPLAY}
-    for c in [f"scrot {path}", f"gnome-screenshot -f {path}", f"import -window root {path}"]:
+    if wayland:
+        env["WAYLAND_DISPLAY"] = wayland
+    # Try tools in order — grim for Wayland, scrot/import for X11
+    candidates = []
+    if wayland:
+        candidates += [
+            f"grim {path}",
+            f"WAYLAND_DISPLAY={wayland} grim {path}",
+        ]
+    candidates += [
+        f"scrot {path}",
+        f"import -window root {path}",
+        f"ffmpeg -y -f x11grab -i {DISPLAY} -vframes 1 {path} 2>/dev/null",
+    ]
+    for c in candidates:
         r = subprocess.run(c, shell=True, env=env, capture_output=True)
-        if r.returncode == 0 and os.path.exists(path):
+        if r.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 100:
             with open(path, "rb") as f: data = f.read()
             os.remove(path)
             return data
@@ -191,6 +206,22 @@ def shell():
 
     if not cmd:
         return jsonify({"error": "no cmd"}), 400
+
+    # Intercept screenshot keyword
+    if cmd == "screenshot":
+        try:
+            ssh = resolve_target(target_id)
+        except KeyError as e:
+            return jsonify({"error": str(e)}), 404
+        png = screenshot_ssh(ssh) if ssh else screenshot_local()
+        if not png:
+            return jsonify({"error": "screenshot failed — no display or scrot missing"}), 500
+        try:
+            jpg = scale_jpeg(png)
+            tg_photo(jpg, f"📸 {target_id}")
+            return jsonify({"output": f"screenshot sent to Telegram", "exit_code": 0})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
     try:
         out, code = run_on(target_id, cmd, password=password)
