@@ -362,6 +362,21 @@ void handle_update(JsonObject &upd) {
         return;
     }
 
+    if (t.startsWith("/pass ")) {
+        // Store SSH password for current target (in-memory on relay, never logged)
+        String pw = t.substring(6); pw.trim();
+        StaticJsonDocument<128> pdoc;
+        pdoc["target"] = s_target; pdoc["password"] = pw;
+        String pbody; serializeJson(pdoc, pbody);
+        HTTPClient hpw;
+        hpw.begin(String(active_relay())+"/target/password");
+        hpw.addHeader("Content-Type","application/json");
+        int code = hpw.POST(pbody); hpw.end();
+        tg_send(chat_id, code==200 ? "🔑 password stored — try /shell whoami" : "❌ relay error");
+        term_ok("pass stored");
+        return;
+    }
+
     if (t.startsWith("/input ")) {
         HTTPClient hinp;
         hinp.begin(String(active_relay())+"/shell/input");

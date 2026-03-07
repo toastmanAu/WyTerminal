@@ -202,6 +202,7 @@ def tg_photo(jpg_bytes, caption=""):
 
 # ── Pending password requests ─────────────────────────────────────────
 pending_inputs = {}  # session_id → {"event": threading.Event, "value": str}
+target_passwords = {}  # target_id → SSH password (in-memory only)
 
 # ── Routes ────────────────────────────────────────────────────────────
 @app.route("/shell", methods=["POST"])
@@ -209,7 +210,7 @@ def shell():
     data      = request.get_json(force=True) or {}
     cmd       = data.get("cmd", "")
     target_id = data.get("target", "local")
-    password  = data.get("password")
+    password  = data.get("password") or target_passwords.get(target_id)
 
     if not cmd:
         return jsonify({"error": "no cmd"}), 400
@@ -290,6 +291,15 @@ def screenshot_route():
         return Response(amoled_jpg, mimetype="image/jpeg")
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route("/target/password", methods=["POST"])
+def target_password():
+    """Store SSH password for a target (in-memory only, not persisted to disk)."""
+    data     = request.get_json(force=True) or {}
+    target   = data.get("target", "local")
+    password = data.get("password", "")
+    target_passwords[target] = password
+    return jsonify({"ok": True})
 
 @app.route("/target/add", methods=["POST"])
 def target_add():
