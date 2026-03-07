@@ -1,24 +1,25 @@
 /*
- * WyTerminal — LilyGO T-Display S3 AMOLED (1.91" RM67162)
+ * WyTerminal v2 — No Daemon Edition
  *
- * Full Linux terminal over Telegram:
- *  - USB HID keyboard injection
- *  - Telegram bot: /shell /screenshot /key /run /type /upload /sysinfo /ps
- *  - AMOLED scrolling terminal log
- *  - Screenshot preview: daemon sends scaled JPEG → rendered inline on AMOLED
+ * ESP32-S3 AMOLED (LilyGO T-Display S3 AMOLED 1.91" RM67162)
+ *
+ * Architecture:
+ *   Telegram → WyTerminal (WiFi) → HTTP POST to Pi relay → SSH to target → output back
+ *
+ * - USB HID keyboard injection (no daemon needed for this)
+ * - Shell commands via HTTP relay on Pi (no per-machine install)
+ * - AMOLED scrolling terminal display
+ * - Multi-target: /target <name> to switch machines
  *
  * Board: LilyGo T-Display-S3 | USB Mode: USB-OTG (TinyUSB) | CDC On Boot: Enabled
- * Libraries: Arduino_GFX (github.com/moononournation/Arduino_GFX), ArduinoJson, TJpg_Decoder
- *
- * Serial protocol (115200):
- *   ESP32→daemon: CMD:<command>\n
- *   daemon→ESP32: OUT:<text>\n | ERR:<text>\n | IMG:<len>\n<jpeg bytes>
+ * Libraries: Arduino_GFX, ArduinoJson, TJpg_Decoder
  */
 
 #include "USB.h"
 #include "USBHIDKeyboard.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Arduino_GFX_Library.h>
 #include <TJpg_Decoder.h>
@@ -28,6 +29,11 @@
 #define WIFI_PASSWORD    "Ajeip853jw5590!"
 #define BOT_TOKEN        "8688942400:AAFZKipOJnzroUWAea-zZuhZbLbRTiAluLM"
 #define ALLOWED_CHAT_ID  1790655432LL
+
+// Pi relay server (always on, runs wyrelay.py)
+#define RELAY_HOST       "192.168.68.82"
+#define RELAY_PORT       7799
+#define RELAY_URL        "http://192.168.68.82:7799"
 
 // ── Display pins ──────────────────────────────────────────────────────
 #define LCD_CS   6
@@ -61,7 +67,7 @@
 #define C_DKGREEN 0x0200
 #define C_DKBLUE  0x000A
 
-// ── Display object ────────────────────────────────────────────────────
+// ── Display ───────────────────────────────────────────────────────────
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(
     LCD_CS, LCD_SCK, LCD_D0, LCD_D1, LCD_D2, LCD_D3);
 Arduino_GFX *gfx = new Arduino_RM67162(bus, LCD_RST, 0);
@@ -73,14 +79,13 @@ static long     s_offset   = 0;
 static uint32_t s_start_ms = 0;
 static char     s_last_text[512] = "";
 static bool     s_wifi_ok  = false;
+static char     s_target[32] = "local";  // current SSH target
 
-// ── Terminal ring buffer ──────────────────────────────────────────────
-struct Line { char text[TERM_COLS + 1]; uint16_t col; bool is_img; int img_h; };
+// ── Terminal ──────────────────────────────────────────────────────────
+struct Line { char text[TERM_COLS + 1]; uint16_t col; };
 static Line s_buf[TERM_LINES];
 static int  s_count = 0;
-
-// ── JPEG → AMOLED via TJpg_Decoder ───────────────────────────────────
-static int  s_jpg_draw_y = 0;  // top-left Y for current decode
+static int  s_jpg_draw_y = 0;
 
 bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
     if (y >= SCREEN_H) return false;
@@ -88,12 +93,10 @@ bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) 
     return true;
 }
 
-// ── Brightness ────────────────────────────────────────────────────────
 void set_brightness(uint8_t v) {
     bus->beginWrite(); bus->writeC8D8(0x51, v); bus->endWrite();
 }
 
-// ── Terminal ──────────────────────────────────────────────────────────
 void term_redraw() {
     gfx->fillRect(0, TERM_Y, SCREEN_W, TERM_H, C_BG);
     int start = (s_count > TERM_LINES) ? s_count - TERM_LINES : 0;
@@ -109,15 +112,37 @@ void term_push(const char *text, uint16_t col) {
     if (s_count < TERM_LINES) {
         strncpy(s_buf[s_count].text, text, TERM_COLS);
         s_buf[s_count].col = col;
-        s_buf[s_count].is_img = false;
         s_count++;
     } else {
         memmove(s_buf, s_buf + 1, sizeof(Line) * (TERM_LINES - 1));
         strncpy(s_buf[TERM_LINES-1].text, text, TERM_COLS);
         s_buf[TERM_LINES-1].col = col;
-        s_buf[TERM_LINES-1].is_img = false;
     }
     term_redraw();
+}
+
+void term_show_jpeg(uint8_t *jpg, size_t len) {
+    int img_h = 135;
+    for (size_t i = 4; i < len - 9; i++) {
+        if (jpg[i] == 0xFF && (jpg[i+1] == 0xC0 || jpg[i+1] == 0xC2)) {
+            img_h = (jpg[i+5] << 8) | jpg[i+6]; break;
+        }
+    }
+    img_h = min(img_h, TERM_H - FONT_H);
+    int lines_needed = (img_h + FONT_H - 1) / FONT_H;
+    char label[TERM_COLS+1];
+    snprintf(label, sizeof(label), "[screenshot %dx%d]", SCREEN_W, img_h);
+    term_push(label, C_GREY);
+    for (int i = 1; i < lines_needed; i++) term_push("", C_BG);
+    int start = (s_count > TERM_LINES) ? s_count - TERM_LINES : 0;
+    int img_line = (s_count - lines_needed) - start;
+    s_jpg_draw_y = TERM_Y + img_line * FONT_H;
+    if (s_jpg_draw_y >= TERM_Y) {
+        gfx->fillRect(0, s_jpg_draw_y, SCREEN_W, img_h, C_BG);
+        TJpgDec.setCallback(tft_output);
+        TJpgDec.setJpgScale(1);
+        TJpgDec.drawJpg(0, 0, jpg, len);
+    }
 }
 
 void term_cmd(const char *s)  { char b[42]; snprintf(b,42,"> %.39s",s); term_push(b, C_CYAN);   }
@@ -126,46 +151,12 @@ void term_err(const char *s)  { char b[42]; snprintf(b,42,"  %.39s",s); term_pus
 void term_info(const char *s) { char b[42]; snprintf(b,42,"  %.39s",s); term_push(b, C_GREY);   }
 void term_head(const char *s) { char b[42]; snprintf(b,42,"%.41s",s);   term_push(b, C_YELLOW); }
 
-// Draw JPEG inline — push enough placeholder lines to scroll terminal up,
-// then decode JPEG into that cleared space
-void term_show_jpeg(uint8_t *jpg, size_t len) {
-    // Peek image height from JPEG SOF marker
-    int img_h = 135;
-    for (size_t i = 4; i < len - 9; i++) {
-        if (jpg[i] == 0xFF && (jpg[i+1] == 0xC0 || jpg[i+1] == 0xC2)) {
-            img_h = (jpg[i+5] << 8) | jpg[i+6];
-            break;
-        }
-    }
-    img_h = min(img_h, TERM_H - FONT_H);
-    int lines_needed = (img_h + FONT_H - 1) / FONT_H;
-
-    // Add placeholder lines to scroll buffer
-    char label[TERM_COLS+1];
-    snprintf(label, sizeof(label), "[img %dx%d]", SCREEN_W, img_h);
-    term_push(label, C_GREY);
-    for (int i = 1; i < lines_needed; i++) term_push("", C_BG);
-
-    // Find Y coordinate where those lines land on screen
-    int start = (s_count > TERM_LINES) ? s_count - TERM_LINES : 0;
-    int img_line = (s_count - lines_needed) - start;
-    s_jpg_draw_y = TERM_Y + img_line * FONT_H;
-
-    if (s_jpg_draw_y >= TERM_Y) {
-        // Clear the image area first
-        gfx->fillRect(0, s_jpg_draw_y, SCREEN_W, img_h, C_BG);
-        // Decode and draw
-        TJpgDec.setCallback(tft_output);
-        TJpgDec.setJpgScale(1);
-        TJpgDec.drawJpg(0, 0, jpg, len);  // xy offset applied via s_jpg_draw_y
-    }
-}
-
-// ── Header / footer ───────────────────────────────────────────────────
 void draw_header() {
     gfx->fillRect(0, 0, SCREEN_W, HEADER_H, C_DKGREEN);
     gfx->setTextColor(C_GREEN); gfx->setTextSize(1);
-    gfx->setCursor(4, 8); gfx->print("WyTerminal");
+    gfx->setCursor(4, 8);
+    char h[30]; snprintf(h, sizeof(h), "WyTerminal [%s]", s_target);
+    gfx->print(h);
     gfx->setCursor(SCREEN_W - 30, 8);
     gfx->setTextColor(s_wifi_ok ? C_GREEN : C_RED);
     gfx->print(s_wifi_ok ? " LIVE" : " WAIT");
@@ -198,7 +189,7 @@ String tg_post(const char *method, const String &body) {
     tls_client.println();
     tls_client.print(body);
     String resp; uint32_t t = millis();
-    while (tls_client.connected() && millis() - t < 6000)
+    while (tls_client.connected() && millis() - t < 8000)
         while (tls_client.available()) resp += (char)tls_client.read();
     tls_client.stop();
     int idx = resp.indexOf("\r\n\r\n");
@@ -212,39 +203,60 @@ void tg_send(long long chat_id, const char *text) {
     tg_post("sendMessage", body);
 }
 
+// ── HTTP Relay (Pi) ───────────────────────────────────────────────────
+// POST {cmd, target} → relay runs SSH command → returns {output, exit_code}
+// For screenshot: POST {cmd:"screenshot", target} → returns JPEG bytes as base64
+String relay_shell(const char *cmd) {
+    HTTPClient http;
+    http.begin(String(RELAY_URL) + "/shell");
+    http.addHeader("Content-Type", "application/json");
+    StaticJsonDocument<256> req;
+    req["cmd"]    = cmd;
+    req["target"] = s_target;
+    String body; serializeJson(req, body);
+    int code = http.POST(body);
+    String resp = (code > 0) ? http.getString() : "{\"error\":\"relay unreachable\"}";
+    http.end();
+    return resp;
+}
+
+bool relay_screenshot(long long chat_id) {
+    HTTPClient http;
+    http.begin(String(RELAY_URL) + "/screenshot");
+    http.addHeader("Content-Type", "application/json");
+    StaticJsonDocument<64> req;
+    req["target"] = s_target;
+    String body; serializeJson(req, body);
+    int code = http.POST(body);
+    if (code != 200) { http.end(); return false; }
+
+    // Response is raw JPEG bytes
+    int len = http.getSize();
+    if (len <= 0 || len > 65536) { http.end(); return false; }
+
+    uint8_t *jpg = (uint8_t*)malloc(len);
+    if (!jpg) { http.end(); return false; }
+
+    WiFiClient *stream = http.getStreamPtr();
+    int got = 0;
+    uint32_t t = millis();
+    while (got < len && millis() - t < 10000) {
+        if (stream->available()) jpg[got++] = stream->read();
+    }
+    http.end();
+
+    if (got == len) {
+        term_show_jpeg(jpg, len);
+        // Send to Telegram via relay (relay already did that)
+    }
+    free(jpg);
+    return got == len;
+}
+
 // ── HID ───────────────────────────────────────────────────────────────
 void hid_type(const char *text, bool enter) {
     Keyboard.print(text);
     if (enter) { delay(50); Keyboard.press(KEY_RETURN); delay(50); Keyboard.releaseAll(); }
-}
-
-// ── Serial → daemon pipeline ─────────────────────────────────────────
-static uint8_t s_jpg_buf[65536];
-static size_t  s_jpg_expected = 0;
-static size_t  s_jpg_received = 0;
-static bool    s_jpg_mode = false;
-
-void check_serial() {
-    while (Serial0.available()) {
-        if (s_jpg_mode) {
-            int b = Serial0.read();
-            if (s_jpg_received < sizeof(s_jpg_buf))
-                s_jpg_buf[s_jpg_received++] = (uint8_t)b;
-            if (s_jpg_received >= s_jpg_expected) {
-                term_show_jpeg(s_jpg_buf, s_jpg_received);
-                s_jpg_mode = false; s_jpg_expected = 0; s_jpg_received = 0;
-            }
-        } else {
-            String line = Serial0.readStringUntil('\n'); line.trim();
-            if (!line.length()) continue;
-            if      (line.startsWith("OUT:")) term_ok(line.substring(4).c_str());
-            else if (line.startsWith("ERR:")) term_err(line.substring(4).c_str());
-            else if (line.startsWith("IMG:")) {
-                s_jpg_expected = line.substring(4).toInt();
-                s_jpg_received = 0; s_jpg_mode = true;
-            }
-        }
-    }
 }
 
 // ── Command handler ───────────────────────────────────────────────────
@@ -261,20 +273,119 @@ void handle_update(JsonObject &upd) {
     term_cmd(disp.c_str());
     draw_footer();
 
-    // Daemon-handled commands — forward over serial
-    if (t.startsWith("/shell ") || t == "/screenshot" ||
-        t.startsWith("/upload ") || t == "/clipboard" ||
-        t == "/sysinfo" || t == "/ps") {
-        Serial0.println("CMD:" + t);
+    // Shell via relay
+    if (t.startsWith("/shell ")) {
+        String cmd = t.substring(7);
         tg_send(chat_id, "⏳ running...");
+        term_info("→ relay...");
+        String resp = relay_shell(cmd.c_str());
+        DynamicJsonDocument doc(4096);
+        if (!deserializeJson(doc, resp)) {
+            const char *out  = doc["output"] | "";
+            int         code = doc["exit_code"] | -1;
+            const char *err  = doc["error"] | "";
+            if (strlen(err)) {
+                tg_send(chat_id, (String("❌ ") + err).c_str());
+                term_err(err);
+            } else {
+                String reply = (code == 0 ? "✅ " : "❌ ") + cmd + "\n" + String(out).substring(0, 3800);
+                tg_send(chat_id, reply.c_str());
+                // Show first 3 lines on AMOLED
+                String o(out); int nl = 0, pos = 0;
+                while (nl < 3 && pos < (int)o.length()) {
+                    int end = o.indexOf('\n', pos);
+                    if (end < 0) end = o.length();
+                    String line = o.substring(pos, end);
+                    if (line.length()) term_ok(line.c_str());
+                    pos = end + 1; nl++;
+                }
+            }
+        } else {
+            tg_send(chat_id, "❌ relay error");
+            term_err("relay error");
+        }
         return;
     }
 
-    // Local HID commands
+    if (t == "/screenshot") {
+        tg_send(chat_id, "📸 capturing...");
+        term_info("→ screenshot...");
+        // Relay handles SSH+scrot+TG send, we just get the JPEG for AMOLED
+        String resp = relay_shell("screenshot");
+        DynamicJsonDocument doc(256);
+        if (!deserializeJson(doc, resp)) {
+            const char *err = doc["error"] | "";
+            if (strlen(err)) { tg_send(chat_id, (String("❌ ") + err).c_str()); term_err(err); }
+            else { term_ok("screenshot sent"); }
+        }
+        return;
+    }
+
+    if (t.startsWith("/target ")) {
+        String tgt = t.substring(8); tgt.trim();
+        // If user@host format, register it with relay first
+        if (tgt.indexOf("@") >= 0) {
+            // Parse optional alias: /target alias user@host
+            int sp = tgt.indexOf(" ");
+            String alias, host;
+            if (sp > 0) { alias = tgt.substring(0, sp); host = tgt.substring(sp+1); }
+            else { alias = tgt; host = tgt; }
+            // Register with relay
+            HTTPClient hreg;
+            hreg.begin(String(RELAY_URL) + "/target/add");
+            hreg.addHeader("Content-Type", "application/json");
+            StaticJsonDocument<128> reg;
+            reg["alias"] = alias; reg["host"] = host;
+            String rb; serializeJson(reg, rb);
+            hreg.POST(rb); hreg.end();
+            tgt = alias;
+        }
+        strncpy(s_target, tgt.c_str(), sizeof(s_target)-1);
+        draw_header();
+        tg_send(chat_id, (String("🎯 Target: ") + s_target).c_str());
+        term_ok(("target: " + tgt).c_str());
+        return;
+    }
+
+    if (t.startsWith("/input ")) {
+        // Forward password/input to relay for pending sudo
+        String val = t.substring(7);
+        HTTPClient hinp;
+        hinp.begin(String(RELAY_URL) + "/shell/input");
+        hinp.addHeader("Content-Type", "application/json");
+        StaticJsonDocument<128> inp;
+        inp["value"] = val;
+        String ib; serializeJson(inp, ib);
+        int code = hinp.POST(ib); hinp.end();
+        tg_send(chat_id, code == 200 ? "🔑 sent" : "❌ no pending input");
+        term_ok("input sent");
+        return;
+    }
+
+    if (t == "/targets") {
+        HTTPClient hlist;
+        hlist.begin(String(RELAY_URL) + "/targets");
+        int code = hlist.GET();
+        String resp = (code > 0) ? hlist.getString() : "{}";
+        hlist.end();
+        DynamicJsonDocument doc(1024);
+        String out = "📋 Targets:\n";
+        if (!deserializeJson(doc, resp)) {
+            for (JsonPair kv : doc.as<JsonObject>()) {
+                out += String("  ") + kv.key().c_str() + " → " +
+                       (kv.value().isNull() ? "local" : kv.value().as<String>()) + "\n";
+            }
+        }
+        out += "\nCurrent: " + String(s_target);
+        tg_send(chat_id, out.c_str());
+        term_info("targets listed");
+        return;
+    }
+
+    // HID commands
     if (t.startsWith("/run ")) {
-        String cmd = t.substring(5);
-        hid_type(cmd.c_str(), true);
-        tg_send(chat_id, ("▶️ " + cmd).c_str());
+        hid_type(t.substring(5).c_str(), true);
+        tg_send(chat_id, ("▶️ " + t.substring(5)).c_str());
         term_ok("sent+Enter");
 
     } else if (t.startsWith("/type ")) {
@@ -304,42 +415,16 @@ void handle_update(JsonObject &upd) {
         else if (ks=="a")    key='a'; else if (ks=="x")  key='x';
         else if (ks=="f4")   key=KEY_F4; else if (ks=="f5") key=KEY_F5;
         else if (ks=="tab")  key=KEY_TAB; else if (ks=="esc") key=KEY_ESC;
-        else if (ks=="space")key=' ';
-        else if (ks=="up")   key=KEY_UP_ARROW;
-        else if (ks=="down") key=KEY_DOWN_ARROW;
-        else if (ks=="left") key=KEY_LEFT_ARROW;
+        else if (ks=="space")key=' '; else if (ks=="up")   key=KEY_UP_ARROW;
+        else if (ks=="down") key=KEY_DOWN_ARROW; else if (ks=="left") key=KEY_LEFT_ARROW;
         else if (ks=="right")key=KEY_RIGHT_ARROW;
         else if (ks.length()==1) key=(uint8_t)ks[0];
         if (key) {
-            if (ctrl)  Keyboard.press(KEY_LEFT_CTRL);
-            if (alt)   Keyboard.press(KEY_LEFT_ALT);
-            if (shift) Keyboard.press(KEY_LEFT_SHIFT);
-            if (sup)   Keyboard.press(KEY_LEFT_GUI);
+            if (ctrl) Keyboard.press(KEY_LEFT_CTRL); if (alt) Keyboard.press(KEY_LEFT_ALT);
+            if (shift) Keyboard.press(KEY_LEFT_SHIFT); if (sup) Keyboard.press(KEY_LEFT_GUI);
             Keyboard.press(key); delay(100); Keyboard.releaseAll();
-            tg_send(chat_id, ("⌨️ " + combo).c_str());
-            term_ok(combo.c_str());
+            tg_send(chat_id, ("⌨️ " + combo).c_str()); term_ok(combo.c_str());
         } else { tg_send(chat_id, "❓ unknown key"); term_err("unknown key"); }
-
-    } else if (t == "/undeploy") {
-        const char *uninstaller =
-            "curl -fsSL https://wyltekindustries.com/wyterminal/uninstall.sh | sudo bash";
-        hid_type(uninstaller, true);
-        tg_send(chat_id,
-            "🗑 Uninstall command typed.\n"
-            "Daemon will be removed from target machine.");
-        term_ok("undeploying...");
-
-    } else if (t == "/deploy") {
-        // Type the one-liner installer into whatever terminal is open on target
-        const char *installer =
-            "curl -fsSL https://wyltekindustries.com/wyterminal/install.sh | sudo bash";
-        hid_type(installer, true);
-        tg_send(chat_id,
-            "🚀 Deploy command typed!\n\n"
-            "Make sure a terminal is open on the target machine.\n"
-            "Use /key ctrl+alt+t first if needed.\n\n"
-            "Daemon will auto-install and send a confirmation.");
-        term_ok("deploying daemon...");
 
     } else if (t == "/clear") {
         s_count = 0; gfx->fillRect(0, TERM_Y, SCREEN_W, TERM_H, C_BG);
@@ -348,31 +433,32 @@ void handle_update(JsonObject &upd) {
     } else if (t == "/status") {
         uint32_t up = (millis() - s_start_ms) / 1000;
         char buf[128];
-        snprintf(buf, sizeof(buf), "✅ WyTerminal\nIP: %s\nRSSI: %ddBm\nUptime: %lus",
-            WiFi.localIP().toString().c_str(), WiFi.RSSI(), (unsigned long)up);
+        snprintf(buf, sizeof(buf), "✅ WyTerminal\nTarget: %s\nIP: %s\nRSSI: %ddBm\nUptime: %lus",
+            s_target, WiFi.localIP().toString().c_str(), WiFi.RSSI(), (unsigned long)up);
         tg_send(chat_id, buf); term_info("status sent");
 
     } else if (t == "/help") {
         tg_send(chat_id,
-            "WyTerminal — Linux on Telegram\n\n"
-            "Shell (needs daemon):\n"
-            "/shell <cmd> — run + output\n"
+            "WyTerminal v2 — No Daemon\n\n"
+            "Shell (via Pi relay):\n"
+            "/shell <cmd> — run on target\n"
             "/screenshot — screen→TG+AMOLED\n"
-            "/upload <path> — file→TG\n"
-            "/clipboard — read clipboard\n"
-            "/sysinfo — CPU/RAM/disk/IP\n"
-            "/ps — top processes\n\n"
-            "Keyboard (HID, no daemon):\n"
+            "/input <text> — reply to sudo prompt\n\n"
+            "Targets (dynamic):\n"
+            "/target user@192.168.1.5\n"
+            "/target alias user@host\n"
+            "/target alias — switch to saved\n"
+            "/targets — list all\n\n"
+            "Keyboard (HID, direct):\n"
             "/run <cmd> — type+Enter\n"
             "/type <text> — type only\n"
             "/enter — Enter key\n"
             "/paste — retype last\n"
             "/key ctrl+alt+t etc\n\n"
-            "/clear /status /deploy /help");
+            "/clear /status /help");
         term_info("help sent");
     } else {
-        tg_send(chat_id, "❓ /help for commands");
-        term_err("unknown cmd");
+        tg_send(chat_id, "❓ /help"); term_err("unknown");
     }
 }
 
@@ -392,52 +478,34 @@ void poll_telegram() {
     }
 }
 
-// ── Setup ─────────────────────────────────────────────────────────────
 void setup() {
-    Serial0.begin(115200); // UART (ACM0 on host)
-    Serial.begin(115200);   // USB CDC (debug)
+    Serial.begin(115200);
     pinMode(LCD_PWR, OUTPUT); digitalWrite(LCD_PWR, HIGH); delay(50);
-
-    gfx->begin();
-    set_brightness(200);
-    gfx->fillScreen(C_BG);
-    gfx->setTextSize(1); gfx->setTextWrap(false);
-
-    TJpgDec.setCallback(tft_output);
-    TJpgDec.setJpgScale(1);
-
+    gfx->begin(); set_brightness(200);
+    gfx->fillScreen(C_BG); gfx->setTextSize(1); gfx->setTextWrap(false);
+    TJpgDec.setCallback(tft_output); TJpgDec.setJpgScale(1);
     draw_header(); draw_footer();
-    term_head("WyTerminal v1.0");
-    term_info("by Wyltek Industries");
+    term_head("WyTerminal v2.0");
+    term_info("No-Daemon Edition");
     term_info("─────────────────────");
-
     USB.begin(); Keyboard.begin(); delay(200);
     term_ok("USB HID ready");
-
     tls_client.setInsecure();
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     term_info("WiFi connecting...");
-
     uint32_t t = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - t < 30000) delay(500);
     s_start_ms = millis();
-
     if (WiFi.status() == WL_CONNECTED) {
         s_wifi_ok = true; draw_header();
         char buf[40]; snprintf(buf, sizeof(buf), "%s", WiFi.localIP().toString().c_str());
-        term_ok(buf);
-        term_ok("Ready — /help for commands");
-    } else {
-        term_err("WiFi failed!");
-    }
+        term_ok(buf); term_ok("Ready — /help");
+    } else { term_err("WiFi failed!"); }
     draw_footer();
 }
 
-// ── Loop ──────────────────────────────────────────────────────────────
 static uint32_t s_last_footer = 0;
 void loop() {
-    check_serial();
     if (s_wifi_ok) {
         if (WiFi.status() != WL_CONNECTED) { s_wifi_ok = false; draw_header(); WiFi.reconnect(); }
         poll_telegram();
