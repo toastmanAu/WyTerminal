@@ -25,7 +25,8 @@ Endpoints:
 from flask import Flask, request, jsonify, Response
 import subprocess, os, json, io, threading, time, tempfile
 from pathlib import Path
-from PIL import Image
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 app = Flask(__name__)
 
@@ -166,13 +167,20 @@ def screenshot_ssh(host):
         return base64.b64decode(''.join(lines))
     except: return None
 
-def scale_jpeg(png_bytes):
+def scale_jpeg(png_bytes, width=PREVIEW_W):
     img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
     w, h = img.size
-    new_h = int(h * PREVIEW_W / w)
-    img = img.resize((PREVIEW_W, new_h), Image.LANCZOS)
+    new_h = int(h * width / w)
+    img = img.resize((width, new_h), Image.LANCZOS)
     out = io.BytesIO()
-    img.save(out, format="JPEG", quality=75, optimize=True)
+    img.save(out, format="JPEG", quality=85, optimize=True)
+    return out.getvalue()
+
+def full_jpeg(png_bytes):
+    """Full resolution JPEG for Telegram — no downscale."""
+    img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=90, optimize=True)
     return out.getvalue()
 
 def tg_send(text):
@@ -216,9 +224,11 @@ def shell():
         if not png:
             return jsonify({"error": "screenshot failed — no display or scrot missing"}), 500
         try:
-            jpg = scale_jpeg(png)
-            tg_photo(jpg, f"📸 {target_id}")
-            return jsonify({"output": f"screenshot sent to Telegram", "exit_code": 0})
+            tg_jpg = full_jpeg(png)       # full res → Telegram
+            amoled_jpg = scale_jpeg(png)  # 240px → board AMOLED
+            tg_photo(tg_jpg, f"📸 {target_id}")
+            return jsonify({"output": f"screenshot sent to Telegram", "exit_code": 0,
+                            "jpeg_b64": __import__('base64').b64encode(amoled_jpg).decode()})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
@@ -274,10 +284,10 @@ def screenshot_route():
     if not png:
         return jsonify({"error": "screenshot failed — no display or scrot missing"}), 500
     try:
-        jpg = scale_jpeg(png)
-        # Also send to Telegram
-        tg_photo(jpg, f"📸 {target_id}")
-        return Response(jpg, mimetype="image/jpeg")
+        tg_jpg    = full_jpeg(png)
+        amoled_jpg = scale_jpeg(png)
+        tg_photo(tg_jpg, f"📸 {target_id}")
+        return Response(amoled_jpg, mimetype="image/jpeg")
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
