@@ -25,15 +25,8 @@
 #include <TJpg_Decoder.h>
 
 // ── Config ────────────────────────────────────────────────────────────
-#define WIFI_SSID        "D-Link the router"
-#define WIFI_PASSWORD    "Ajeip853jw5590!"
-#define BOT_TOKEN        "8688942400:AAFZKipOJnzroUWAea-zZuhZbLbRTiAluLM"
-#define ALLOWED_CHAT_ID  1790655432LL
-
-// Pi relay server (always on, runs wyrelay.py)
-#define RELAY_HOST       "192.168.68.82"
-#define RELAY_PORT       7799
-#define RELAY_URL        "http://192.168.68.82:7799"
+// Copy secrets.h.example → secrets.h and fill in your values
+#include "secrets.h"
 
 // ── Display pins ──────────────────────────────────────────────────────
 #define LCD_CS   6
@@ -206,10 +199,11 @@ void tg_send(long long chat_id, const char *text) {
 // ── HTTP Relay (Pi) ───────────────────────────────────────────────────
 // POST {cmd, target} → relay runs SSH command → returns {output, exit_code}
 // For screenshot: POST {cmd:"screenshot", target} → returns JPEG bytes as base64
-String relay_shell(const char *cmd) {
+String relay_shell(const char *cmd, int timeout_ms = 8000) {
     HTTPClient http;
     http.begin(String(RELAY_URL) + "/shell");
     http.addHeader("Content-Type", "application/json");
+    http.setTimeout(timeout_ms);
     StaticJsonDocument<256> req;
     req["cmd"]    = cmd;
     req["target"] = s_target;
@@ -310,13 +304,44 @@ void handle_update(JsonObject &upd) {
     if (t == "/screenshot") {
         tg_send(chat_id, "📸 capturing...");
         term_info("→ screenshot...");
-        // Relay handles SSH+scrot+TG send, we just get the JPEG for AMOLED
-        String resp = relay_shell("screenshot");
-        DynamicJsonDocument doc(256);
-        if (!deserializeJson(doc, resp)) {
-            const char *err = doc["error"] | "";
-            if (strlen(err)) { tg_send(chat_id, (String("❌ ") + err).c_str()); term_err(err); }
-            else { term_ok("screenshot sent"); }
+        String resp = relay_shell("screenshot", 30000);  // 30s — screenshot+TG upload takes time
+        // Parse — use a big doc since jpeg_b64 can be large
+        DynamicJsonDocument doc(65536);
+        DeserializationError err2 = deserializeJson(doc, resp);
+        if (err2) { term_err("parse error"); return; }
+        const char *err = doc["error"] | "";
+        if (strlen(err)) { tg_send(chat_id, (String("❌ ") + err).c_str()); term_err(err); return; }
+        term_ok("TG sent");
+        // Decode base64 JPEG and show on AMOLED
+        const char *b64 = doc["jpeg_b64"] | "";
+        if (strlen(b64) > 10) {
+            size_t out_len = 0;
+            // base64 decode: 4 chars → 3 bytes
+            size_t b64_len = strlen(b64);
+            size_t max_bytes = (b64_len / 4) * 3 + 4;
+            uint8_t *jpg = (uint8_t*)malloc(max_bytes);
+            if (jpg) {
+                // Simple base64 decode
+                static const uint8_t dtable[256] = {
+                    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+                    0,0,0,0,0,0,0,0,0,0,0,62,0,0,0,63,52,53,54,55,56,57,58,59,60,61,
+                    0,0,0,0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,
+                    20,21,22,23,24,25,0,0,0,0,0,0,26,27,28,29,30,31,32,33,34,35,36,37,
+                    38,39,40,41,42,43,44,45,46,47,48,49,50,51
+                };
+                size_t i = 0; out_len = 0;
+                while (i + 3 < b64_len) {
+                    uint8_t a=dtable[(uint8_t)b64[i]], b=dtable[(uint8_t)b64[i+1]],
+                            c=dtable[(uint8_t)b64[i+2]], d=dtable[(uint8_t)b64[i+3]];
+                    jpg[out_len++] = (a<<2)|(b>>4);
+                    if (b64[i+2] != '=') jpg[out_len++] = (b<<4)|(c>>2);
+                    if (b64[i+3] != '=') jpg[out_len++] = (c<<6)|d;
+                    i += 4;
+                }
+                if (out_len > 100) term_show_jpeg(jpg, out_len);
+                else term_err("jpeg too small");
+                free(jpg);
+            } else { term_err("no mem"); }
         }
         return;
     }
