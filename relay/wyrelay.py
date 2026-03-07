@@ -294,12 +294,23 @@ def screenshot_route():
 
 @app.route("/target/password", methods=["POST"])
 def target_password():
-    """Store SSH password for a target (in-memory only, not persisted to disk)."""
+    """Store SSH password for a target and verify it immediately."""
     data     = request.get_json(force=True) or {}
     target   = data.get("target", "local")
     password = data.get("password", "")
-    target_passwords[target] = password
-    return jsonify({"ok": True})
+    try:
+        host = resolve_target(target)
+    except KeyError as e:
+        return jsonify({"ok": False, "error": str(e)}), 404
+    if not host:
+        return jsonify({"ok": True, "verified": True, "note": "local target, no SSH needed"})
+    # Test SSH with the password
+    out, code = run_ssh(host, "whoami", timeout=10, password=password)
+    if code == 0:
+        target_passwords[target] = password
+        return jsonify({"ok": True, "verified": True, "user": out.strip()})
+    else:
+        return jsonify({"ok": False, "verified": False, "error": out.strip()}), 401
 
 @app.route("/target/add", methods=["POST"])
 def target_add():

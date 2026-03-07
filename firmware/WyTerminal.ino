@@ -24,6 +24,7 @@
 
 #include "USB.h"
 #include "USBHIDKeyboard.h"
+#include "usb_ncm.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -83,9 +84,10 @@ static bool     s_usb_relay = false;   // relay found via USB net
 static char     s_target[32] = "local";
 static char     s_last_text[512] = "";
 
-// active relay URL — USB first, WiFi fallback
+// active relay URL — USB net first, WiFi fallback
 static const char *active_relay() {
-    return s_usb_relay ? RELAY_USB_URL : RELAY_URL;
+    if (usb_ncm_connected() && s_usb_relay) return RELAY_USB_URL;
+    return RELAY_URL;
 }
 
 // ── Terminal ──────────────────────────────────────────────────────
@@ -363,7 +365,7 @@ void handle_update(JsonObject &upd) {
     }
 
     if (t.startsWith("/pass ")) {
-        // Store SSH password for current target (in-memory on relay, never logged)
+        // Store SSH password for current target — relay verifies immediately
         String pw = t.substring(6); pw.trim();
         StaticJsonDocument<128> pdoc;
         pdoc["target"] = s_target; pdoc["password"] = pw;
@@ -371,9 +373,27 @@ void handle_update(JsonObject &upd) {
         HTTPClient hpw;
         hpw.begin(String(active_relay())+"/target/password");
         hpw.addHeader("Content-Type","application/json");
-        int code = hpw.POST(pbody); hpw.end();
-        tg_send(chat_id, code==200 ? "🔑 password stored — try /shell whoami" : "❌ relay error");
-        term_ok("pass stored");
+        hpw.setTimeout(15000);
+        String pb2 = pbody;
+        int code = hpw.POST(pb2);
+        String resp = (code > 0) ? hpw.getString() : "";
+        hpw.end();
+        DynamicJsonDocument rdoc(512);
+        if (!deserializeJson(rdoc, resp)) {
+            bool ok = rdoc["verified"] | false;
+            const char *err = rdoc["error"] | "";
+            const char *user = rdoc["user"] | "";
+            if (ok) {
+                tg_send(chat_id, (String("✅ SSH auth OK — logged in as: ") + user).c_str());
+                term_ok(("auth ok: "+String(user)).c_str());
+            } else {
+                tg_send(chat_id, (String("❌ SSH auth failed: ") + err).c_str());
+                term_err("auth failed");
+            }
+        } else {
+            tg_send(chat_id, "❌ relay error");
+            term_err("relay error");
+        }
         return;
     }
 
@@ -536,7 +556,8 @@ void setup() {
     term_info("USB Composite Edition");
     term_info("──────────────────────");
     USB.begin(); Keyboard.begin(); delay(200);
-    term_ok("HID keyboard ready");
+    usb_ncm_init();
+    term_ok("HID + NCM ready");
     tls_client.setInsecure();
     WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     term_info("WiFi connecting...");
@@ -574,5 +595,6 @@ void loop() {
         }
     } else if(WiFi.status()==WL_CONNECTED){s_wifi_ok=true;draw_header();discover_relay();}
     if(millis()-s_last_footer>5000){draw_footer();s_last_footer=millis();}
+    usb_ncm_poll();
     delay(1000);
 }
