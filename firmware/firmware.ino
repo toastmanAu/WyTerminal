@@ -245,7 +245,7 @@ void bootstrap_usb_relay() {
     s_usb_relay = false;
     term_err("relay install failed");
     tg_send(ALLOWED_CHAT_ID,
-        "\xE2\x9A\xA0 USB relay bootstrap failed.\n"
+        "⚠ USB relay bootstrap failed.\n"
         "If target is at a login prompt, send:\n"
         "  /run <user>         (username + Enter)\n"
         "  /password <pass>    (password + Enter, hidden on AMOLED)\n"
@@ -578,14 +578,8 @@ void discover_relay() {
         term_ok("WiFi relay found"); draw_header();
         return;
     }
-    // No WiFi relay — try USB-NCM bootstrap (HID-types embedded daemon onto target)
-    bootstrap_usb_relay();
-    if (s_usb_relay) {
-        s_relay_ok = true;
-        draw_header();
-        return;
-    }
-    // Neither WiFi nor USB relay available
+    // No relay found. USB-NCM bootstrap is handled once per boot in setup(),
+    // not here, to avoid re-typing HID into login prompts on WiFi reconnects.
     term_err("no relay found");
     term_info("/deploy to install");
     draw_header();
@@ -604,6 +598,12 @@ void setup() {
     USB.begin(); Keyboard.begin(); delay(200);
     usb_ncm_init();
     term_ok("HID + NCM ready");
+    // Bootstrap USB-NCM relay ONCE, before WiFi/Telegram are online.
+    // If target is a freshly-booted Linux machine with Python 3, the daemon
+    // will be running on 192.168.7.1:7799 by the time Telegram polling starts.
+    // Does not auto-retry — user drives retries via /deploy to avoid PAM lockouts.
+    bootstrap_usb_relay();
+    if (s_usb_relay) { s_relay_ok = true; draw_header(); }
     tls_client.setInsecure();
     WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     term_info("WiFi connecting...");
