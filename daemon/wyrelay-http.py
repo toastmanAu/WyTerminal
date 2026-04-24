@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""wyrelay-http — stdlib-only HTTP relay for WyTerminal USB-NCM path.
+"""wyrelay-http - stdlib-only HTTP relay for WyTerminal USB-NCM path.
 
 Endpoints:
   GET  /health   -> 200 "OK"
