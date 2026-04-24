@@ -499,8 +499,11 @@ void handle_update(JsonObject &upd) {
         } else { tg_send(chat_id,"❓ unknown key"); term_err("unknown key"); }
     } else if (t=="/deploy") {
         tg_send(chat_id,"🚀 deploying relay on target...");
-        try_deploy_relay();
-        // Check if it came up
+        // Try USB-NCM bootstrap first (offline-safe, embedded daemon)
+        bootstrap_usb_relay();
+        // Fall back to curl/WiFi install if USB path didn't come up
+        if (!s_usb_relay) try_deploy_relay();
+        // Check what came up
         if(check_relay(RELAY_USB_URL)){
             s_usb_relay=true; s_relay_ok=true; draw_header();
             tg_send(chat_id,"✅ USB relay online!");
