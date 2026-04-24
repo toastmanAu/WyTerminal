@@ -319,7 +319,12 @@ void handle_update(JsonObject &upd) {
     if (!text[0]) return;
 
     String t(text);
-    String disp = t.length() > 30 ? t.substring(0, 29) + ">" : t;
+    String disp;
+    if (t.startsWith("/password ")) {
+        disp = "/password ****";
+    } else {
+        disp = t.length() > 30 ? t.substring(0, 29) + ">" : t;
+    }
     term_cmd(disp.c_str());
 
     if (t.startsWith("/shell ")) {
@@ -464,6 +469,14 @@ void handle_update(JsonObject &upd) {
         return;
     }
 
+    if (t.startsWith("/password ")) {
+        String pw = t.substring(10);
+        hid_type(pw.c_str(), true);
+        tg_send(chat_id, "🔐 typed (delete this message)");
+        term_ok("password typed");
+        return;
+    }
+
     if (t.startsWith("/run ")) {
         hid_type(t.substring(5).c_str(),true);
         tg_send(chat_id,("▶️ "+t.substring(5)).c_str()); term_ok("sent+Enter");
@@ -542,6 +555,7 @@ void handle_update(JsonObject &upd) {
             "/run <cmd>+Enter\n"
             "/key ctrl+alt+t\n"
             "/type <text>\n"
+            "/password <pw> (hidden echo, types+Enter)\n"
             "/enter /paste\n\n"
             "/deploy — install relay on target\n"
             "/clear /status /help");
