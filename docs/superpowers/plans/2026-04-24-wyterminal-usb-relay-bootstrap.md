@@ -19,8 +19,8 @@
 | `daemon/wyrelay-http.py` | NEW | Canonical, stdlib-only HTTP daemon source. `/health` and `/shell` endpoints. Single source of truth — embedded into firmware by sync tool. |
 | `daemon/test_wyrelay_http.sh` | NEW | Integration test: spawns daemon, curls `/health` and `/shell`, asserts responses. Run before every commit that touches the daemon. |
 | `tools/sync-embedded-relay.sh` | NEW | Emits `firmware/embedded_relay.h` containing `daemon/wyrelay-http.py` wrapped in a C++ raw string literal. Run after editing the daemon. |
-| `firmware/embedded_relay.h` | NEW (generated) | `const char EMBEDDED_RELAY_PY[] = R"PY(...)PY";` — consumed by `WyTerminal.ino`. Committed to repo so the firmware builds without needing the sync tool. |
-| `firmware/WyTerminal.ino` | EDIT | Add `#include "embedded_relay.h"`. Add `bootstrap_usb_relay()` function. Call it once in `setup()`. Edit `/deploy` branch to call `bootstrap_usb_relay()` before falling back to the existing curl-install `try_deploy_relay()`. Add `/password` branch with AMOLED-echo suppression. |
+| `firmware/embedded_relay.h` | NEW (generated) | `const char EMBEDDED_RELAY_PY[] = R"PY(...)PY";` — consumed by `firmware.ino`. Committed to repo so the firmware builds without needing the sync tool. |
+| `firmware/firmware.ino` | EDIT | Add `#include "embedded_relay.h"`. Add `bootstrap_usb_relay()` function. Call it once in `setup()`. Edit `/deploy` branch to call `bootstrap_usb_relay()` before falling back to the existing curl-install `try_deploy_relay()`. Add `/password` branch with AMOLED-echo suppression. |
 
 Files NOT touched: `firmware/usb_ncm.cpp`, `firmware/usb_ncm.h`, `relay/wyrelay.py`, `daemon/wyrelay-daemon.py` (the legacy serial daemon).
 
@@ -75,16 +75,41 @@ Expected: both ArduinoJson and TJpg_Decoder listed. `Arduino_GFX` directory exis
 The firmware README mentions `Board: LilyGo T-Display-S3`. LilyGO's variant is served through the esp32:esp32 core with `esp32s3` FQBN + a custom board label; in arduino-cli we use the generic `esp32:esp32:esp32s3` with matching build flags:
 
 ```bash
-ARDUINO_FQBN="esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,PSRAM=opi,PartitionScheme=default_8MB,FlashMode=qio,FlashFreq=80,FlashSize=16M,LoopCore=1,EventsCore=1,DebugLevel=none"
+ARDUINO_FQBN="esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,PSRAM=opi,PartitionScheme=default_8MB,FlashMode=qio,FlashSize=16M,LoopCore=1,EventsCore=1,DebugLevel=none"
 echo "$ARDUINO_FQBN" > /tmp/wyterm-fqbn
 cat /tmp/wyterm-fqbn
 ```
 
 Expected: the FQBN string is printed. Save to `/tmp/wyterm-fqbn` so later tasks reference it with `FQBN=$(cat /tmp/wyterm-fqbn)`.
 
-- [ ] **Step 5: Commit nothing — this is environment setup only**
+- [ ] **Step 5: Ensure `firmware/secrets.h` exists (required by firmware.ino)**
 
-No files to commit. Move to Task 1.
+`firmware/secrets.h` is gitignored. A fresh clone has only `secrets.h.example`. For the compile-test steps in later tasks to work, you need a `secrets.h` with at least stub values. If you have real credentials, put them there; otherwise copy the example:
+
+```bash
+[ -f /home/phill/WyTerminal/firmware/secrets.h ] || \
+    cp /home/phill/WyTerminal/firmware/secrets.h.example \
+       /home/phill/WyTerminal/firmware/secrets.h
+ls -l /home/phill/WyTerminal/firmware/secrets.h
+```
+
+Expected: file exists. Real Telegram/WiFi credentials must be filled in before Task 6 (flash) — with stub values the firmware compiles but won't connect to anything useful.
+
+- [ ] **Step 6: Quick toolchain smoke test**
+
+Compile the existing firmware as-is to verify the toolchain works before we start editing it:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+FQBN=$(cat /tmp/wyterm-fqbn)
+arduino-cli compile --fqbn "$FQBN" /home/phill/WyTerminal/firmware
+```
+
+Expected: ends with `Sketch uses NNNNNN bytes (NN%) of program storage space`. If you get an error about an invalid FQBN option, compare against `arduino-cli board details -b esp32:esp32:esp32s3 | grep ^Option` — ESP32 core 3.3.8+ removed the `FlashFreq` key.
+
+- [ ] **Step 7: Commit nothing — this is environment setup only**
+
+No repo files to commit. Move to Task 1.
 
 ---
 
@@ -390,9 +415,9 @@ Python source."
 Implements the function per the spec, with setup() hook. No edits to `/deploy` or `/password` yet — those are later tasks so we can compile-test each change in isolation.
 
 **Files:**
-- Modify: `firmware/WyTerminal.ino` (add `#include`, add function, add `setup()` call)
+- Modify: `firmware/firmware.ino` (add `#include`, add function, add `setup()` call)
 
-- [ ] **Step 1: Add `#include "embedded_relay.h"` near the top of WyTerminal.ino**
+- [ ] **Step 1: Add `#include "embedded_relay.h"` near the top of firmware.ino**
 
 Find the existing include block (around line 29-34):
 ```c
@@ -500,7 +525,7 @@ Common failure modes to fix:
 
 ```bash
 cd /home/phill/WyTerminal
-git add firmware/WyTerminal.ino
+git add firmware/firmware.ino
 git commit -m "feat(firmware): bootstrap_usb_relay() with HID heredoc install
 
 On plug-in, checks USB-NCM connected + /health on 192.168.7.1:7799.
@@ -522,12 +547,12 @@ PAM lockouts from repeated typing into login prompts."
 Existing `/deploy` (line 460) calls `try_deploy_relay()` which HID-types a `curl | bash` install — useless on a network-less target. Compose: try USB path first, fall back to curl path.
 
 **Files:**
-- Modify: `firmware/WyTerminal.ino` (edit `/deploy` branch)
+- Modify: `firmware/firmware.ino` (edit `/deploy` branch)
 
 - [ ] **Step 1: Locate the existing `/deploy` branch**
 
 ```bash
-grep -n '/deploy' /home/phill/WyTerminal/firmware/WyTerminal.ino
+grep -n '/deploy' /home/phill/WyTerminal/firmware/firmware.ino
 ```
 
 Expected: matches around line 460 (`} else if (t=="/deploy") {`) and the help text around line 503.
@@ -573,7 +598,7 @@ Replace with:
 
 The emoji bytes: 🚀 = `\xF0\x9F\x9A\x80`, ✅ = `\xE2\x9C\x85`, ⏳ = `\xE2\x8F\xB3`, — = `\xE2\x80\x94`. Matches the prior UTF-8 escape pattern from Task 3.
 
-If the existing file uses literal UTF-8 emoji bytes (check with `file firmware/WyTerminal.ino` — should say `UTF-8 Unicode text`), you can keep the literal emoji characters and only add the one new line. Skip the UTF-8 escaping in that case.
+If the existing file uses literal UTF-8 emoji bytes (check with `file firmware/firmware.ino` — should say `UTF-8 Unicode text`), you can keep the literal emoji characters and only add the one new line. Skip the UTF-8 escaping in that case.
 
 - [ ] **Step 3: Compile**
 
@@ -593,7 +618,7 @@ void bootstrap_usb_relay();
 
 ```bash
 cd /home/phill/WyTerminal
-git add firmware/WyTerminal.ino
+git add firmware/firmware.ino
 git commit -m "feat(firmware): /deploy tries USB-NCM bootstrap before curl fallback
 
 Previously /deploy only ran try_deploy_relay() (HID-types a
@@ -610,7 +635,7 @@ bootstrap fails."
 New branch in `handle_update()`. Differs from `/run` in two ways: suppresses the AMOLED echo of the argument (renders `> /password ••••` instead of `> /password hunter2`) and replies with a delete-me reminder.
 
 **Files:**
-- Modify: `firmware/WyTerminal.ino` (add `/password` branch; tweak the command echo at the top of `handle_update`)
+- Modify: `firmware/firmware.ino` (add `/password` branch; tweak the command echo at the top of `handle_update`)
 
 - [ ] **Step 1: Modify the echo-at-top logic in handle_update**
 
@@ -684,7 +709,7 @@ Expected: compile succeeds.
 
 ```bash
 cd /home/phill/WyTerminal
-git add firmware/WyTerminal.ino
+git add firmware/firmware.ino
 git commit -m "feat(firmware): /password command with AMOLED echo suppression
 
 Types password + Enter via HID for login-prompt flow. Unlike /run,
@@ -920,7 +945,7 @@ Walking through each §/requirement of the spec and the task that implements it:
 | Non-goal: no prompt visibility | Not implemented (explicit out-of-scope) |
 | Non-goal: no persistent install | Task 1 daemon lives in `/tmp`, not `/usr/local` |
 | Components §1: embedded_relay.h | Task 2 (sync tool generates it) |
-| Components §2: WyTerminal.ino edits | Tasks 3, 4, 5 |
+| Components §2: firmware.ino edits | Tasks 3, 4, 5 |
 | Components §3: wyrelay-http.py | Task 1 |
 | Data flow bootstrap sequence | Task 3 Step 2 (verbatim pseudo-code) |
 | Data flow login-prompt flow | Task 8 Step 4 (operational test of the flow) |
@@ -935,4 +960,4 @@ Walking through each §/requirement of the spec and the task that implements it:
 | Testing: daemon-kill fallback | Not explicitly tested in the plan — add as a followup note if time permits. |
 | Testing: NucBox rescue | Task 8 (the whole task) |
 
-**Gap found:** daemon-kill fallback (spec Testing row 5) is documented in the smoke-test table of the spec but not explicitly executed in this plan. It's a 2-minute test the engineer should do ad-hoc during Task 7 — noting here rather than adding a task because the existing code path (lines 232-236 of WyTerminal.ino) already implements it and hasn't changed.
+**Gap found:** daemon-kill fallback (spec Testing row 5) is documented in the smoke-test table of the spec but not explicitly executed in this plan. It's a 2-minute test the engineer should do ad-hoc during Task 7 — noting here rather than adding a task because the existing code path (lines 232-236 of firmware.ino) already implements it and hasn't changed.
